@@ -33,6 +33,7 @@ from loguru import logger
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
 
 from nemo_curator.stages.audio.inference.llm.vllm_base import VLLMInference
+from nemo_curator.stages.audio.inference.pnc_bert import PunctuationCapitalizationModel
 from nemo_curator.stages.audio.tagging.utils import load_vocab_file
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
@@ -100,16 +101,6 @@ class PNCwithBERTStage(ProcessingStage[AudioTask, AudioTask]):
         return "cpu"
 
     def load_model(self) -> None:
-        try:
-            from nemo.collections.nlp.models import PunctuationCapitalizationModel
-        except (ImportError, ModuleNotFoundError) as e:
-            msg = (
-                f"[{self.name}] Could not import PunctuationCapitalizationModel. "
-                f"This model is only available in nemo_toolkit <= 2.4.1. "
-                f"Install a compatible version to use BERTPNCStage."
-            )
-            raise ImportError(msg) from e
-
         if self.model_path:
             self._pnc_model = PunctuationCapitalizationModel.restore_from(self.model_path)
         else:
