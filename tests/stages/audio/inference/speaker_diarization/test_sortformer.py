@@ -120,29 +120,56 @@ class TestInferenceSortformerStage:
         mock_model.diarize.return_value = fake_segments_per_file
         return mock_model
 
-    def test_process_audio_task(self) -> None:
+    def test_process_produces_tagging_compatible_output(self) -> None:
+        """Segments written to 'segments' key with prefixed speaker IDs and non-speaker gaps."""
         fake_output = [
-            ["0.00 2.70 speaker_0", "0.80 13.60 speaker_1"],
+            ["0.00 2.70 speaker_0", "3.00 13.60 speaker_1"],
         ]
         mock_model = self._make_mock_model(fake_output)
         stage = InferenceSortformerStage(diar_model=mock_model)
 
         task = AudioTask(
-            data={"audio_filepath": "/test/audio1.wav"},
+            data={
+                "resampled_audio_filepath": "/test/audio1.wav",
+                "audio_item_id": "test_id",
+                "duration": 20.0,
+            },
         )
         result = stage.process(task)
 
         assert isinstance(result, AudioTask)
-        assert result.data["audio_filepath"] == "/test/audio1.wav"
-        assert result.data["diar_segments"] == [
-            {"start": 0.0, "end": 2.7, "speaker": "speaker_0"},
-            {"start": 0.8, "end": 13.6, "speaker": "speaker_1"},
-        ]
+        assert "segments" in result.data
+        assert "overlap_segments" in result.data
+        assert result.data["overlap_segments"] == []
+
+        segments = result.data["segments"]
+        speaker_segments = [s for s in segments if s["speaker"] != "no-speaker"]
+        no_speaker_segments = [s for s in segments if s["speaker"] == "no-speaker"]
+
+        assert len(speaker_segments) == 2
+        assert speaker_segments[0]["speaker"] == "test_id_speaker_0"
+        assert speaker_segments[1]["speaker"] == "test_id_speaker_1"
+        assert len(no_speaker_segments) > 0
+
         assert result.task_id.endswith("_sortformer")
         mock_model.diarize.assert_called_once_with(
             audio=["/test/audio1.wav"],
             batch_size=1,
         )
+
+    def test_process_filters_short_segments(self) -> None:
+        """Segments shorter than min_length are excluded."""
+        fake_output = [["0.00 0.30 speaker_0", "1.00 5.00 speaker_1"]]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(diar_model=mock_model, min_length=0.5)
+
+        task = AudioTask(
+            data={"resampled_audio_filepath": "/test/audio.wav", "audio_item_id": "x", "duration": 10.0},
+        )
+        result = stage.process(task)
+        speaker_segments = [s for s in result.data["segments"] if s["speaker"] != "no-speaker"]
+        assert len(speaker_segments) == 1
+        assert speaker_segments[0]["start"] == 1.0
 
     def test_process_writes_rttm(self, tmp_path: Path) -> None:
         fake_output = [["0.00 2.50 speaker_0"]]
@@ -152,7 +179,9 @@ class TestInferenceSortformerStage:
             rttm_out_dir=str(tmp_path),
         )
 
-        task = AudioTask(data={"audio_filepath": "/test/my_audio.wav"})
+        task = AudioTask(
+            data={"resampled_audio_filepath": "/test/my_audio.wav", "duration": 5.0},
+        )
         stage.process(task)
 
         rttm_file = tmp_path / "my_audio.rttm"
@@ -166,11 +195,15 @@ class TestInferenceSortformerStage:
         stage = InferenceSortformerStage(diar_model=mock_model)
 
         task = AudioTask(
-            data={"audio_filepath": "/test/audio1.wav", "extra_key": "extra_value"},
+            data={
+                "resampled_audio_filepath": "/test/audio1.wav",
+                "extra_key": "extra_value",
+                "duration": 5.0,
+            },
         )
         result = stage.process(task)
         assert result.data["extra_key"] == "extra_value"
-        assert "diar_segments" in result.data
+        assert "segments" in result.data
 
     def test_process_uses_session_name_from_data(self, tmp_path: Path) -> None:
         fake_output = [["0.00 1.00 speaker_0"]]
@@ -181,7 +214,47 @@ class TestInferenceSortformerStage:
         )
 
         task = AudioTask(
-            data={"audio_filepath": "/test/audio1.wav", "session_name": "sess_42"},
+            data={
+                "resampled_audio_filepath": "/test/audio1.wav",
+                "session_name": "sess_42",
+                "duration": 5.0,
+            },
         )
         stage.process(task)
         assert (tmp_path / "sess_42.rttm").exists()
+
+    def test_process_custom_filepath_key(self) -> None:
+        """Stage can be configured to read from a different audio path key."""
+        fake_output = [["0.00 3.00 speaker_0"]]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(
+            diar_model=mock_model,
+            audio_filepath_key="audio_filepath",
+        )
+
+        task = AudioTask(
+            data={"audio_filepath": "/test/raw.wav", "audio_item_id": "x", "duration": 5.0},
+        )
+        result = stage.process(task)
+        assert "segments" in result.data
+        mock_model.diarize.assert_called_once_with(audio=["/test/raw.wav"], batch_size=1)
+
+    def test_non_speaker_gaps_cover_full_duration(self) -> None:
+        """Non-speaker segments fill gaps between speaker turns up to audio duration."""
+        fake_output = [["5.00 10.00 speaker_0", "15.00 20.00 speaker_1"]]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(diar_model=mock_model)
+
+        task = AudioTask(
+            data={
+                "resampled_audio_filepath": "/test/audio.wav",
+                "audio_item_id": "x",
+                "duration": 30.0,
+            },
+        )
+        result = stage.process(task)
+        segments = result.data["segments"]
+        no_speaker = [s for s in segments if s["speaker"] == "no-speaker"]
+        assert len(no_speaker) >= 2
+        starts = sorted(s["start"] for s in no_speaker)
+        assert starts[0] == 0.0

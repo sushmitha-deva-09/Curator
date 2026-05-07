@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from huggingface_hub import snapshot_download
 from loguru import logger
 from nemo.collections.asr.models import SortformerEncLabelModel
 
+from nemo_curator.stages.audio.common import get_audio_duration
+from nemo_curator.stages.audio.tagging.utils import add_non_speaker_segments
 from nemo_curator.stages.base import ProcessingStage
 
 if TYPE_CHECKING:
@@ -92,28 +95,38 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     Args:
         model_name: Hugging Face model id. Defaults to "nvidia/diar_streaming_sortformer_4spk-v2.1".
         model_path: Local path to a .nemo checkpoint file; if set, takes precedence over model_name.
-        cache_dir: Directory for caching downloaded model weights. Defaults to HF hub default.
+        cache_dir: Directory for caching downloaded model weights.
         diar_model: Pre-loaded SortformerEncLabelModel; if provided, setup() is a no-op.
-        filepath_key: Key in data for path to audio file. Defaults to "audio_filepath".
-        diar_segments_key: Key in output data for diarization segments list. Defaults to "diar_segments".
-        rttm_out_dir: Optional directory to write RTTM files. Defaults to None.
-        chunk_len: Streaming chunk size in 80 ms frames. Defaults to 340 (~30.4 s latency).
-        chunk_left_context: Left context frames. Defaults to 1.
-        chunk_right_context: Right context frames. Defaults to 40.
-        fifo_len: FIFO queue size in frames. Defaults to 40.
-        spkcache_update_period: Speaker cache update period in frames. Defaults to 300.
-        spkcache_len: Speaker cache size in frames. Defaults to 188.
-        inference_batch_size: Batch size passed to diarize(). Defaults to 1.
-        name: Stage name. Defaults to "Sortformer_inference".
+        audio_filepath_key: Key in data for path to audio file.
+        segments_key: Key in output data for diarization segments list.
+        overlap_segments_key: Key in output data for overlap segments list.
+        rttm_out_dir: Optional directory to write RTTM files.
+        min_length: Minimum segment length in seconds.
+        max_length: Maximum segment length in seconds (used for non-speaker gap splitting).
+        chunk_len: Streaming chunk size in 80 ms frames.
+        chunk_left_context: Left context frames.
+        chunk_right_context: Right context frames.
+        fifo_len: FIFO queue size in frames.
+        spkcache_update_period: Speaker cache update period in frames.
+        spkcache_len: Speaker cache size in frames.
+        inference_batch_size: Batch size passed to diarize().
+        name: Stage name.
     """
 
     model_name: str = "nvidia/diar_streaming_sortformer_4spk-v2.1"
     model_path: str | None = None
     cache_dir: str | None = None
     diar_model: Any | None = None
-    filepath_key: str = "audio_filepath"
-    diar_segments_key: str = "diar_segments"
+
+    audio_filepath_key: str = "resampled_audio_filepath"
+    segments_key: str = "segments"
+    overlap_segments_key: str = "overlap_segments"
+
     rttm_out_dir: str | None = None
+
+    min_length: float = 0.5
+    max_length: float = 40.0
+
     chunk_len: int = 340
     chunk_left_context: int = 1
     chunk_right_context: int = 40
@@ -193,11 +206,21 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             sm.spkcache_update_period = self.spkcache_update_period
         sm.spkcache_len = self.spkcache_len
 
+    def _resolve_speaker_id(self, data_entry: dict, raw_speaker: str) -> str:
+        """Prefix raw speaker label with an entry identifier (matching PyAnnote convention)."""
+        if "audio_item_id" in data_entry:
+            return data_entry["audio_item_id"] + "_" + raw_speaker
+        if "speaker_id" in data_entry:
+            return data_entry["speaker_id"] + "_" + raw_speaker
+        if self.audio_filepath_key in data_entry:
+            return Path(data_entry[self.audio_filepath_key]).stem + "_" + raw_speaker
+        return raw_speaker
+
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
+        return [], [self.audio_filepath_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.filepath_key, self.diar_segments_key]
+        return [], [self.audio_filepath_key, self.segments_key, self.overlap_segments_key]
 
     def diarize(self, audio_paths: list[str]) -> list[list[dict[str, Any]]]:
         """Run Sortformer on a list of audio files.
@@ -212,27 +235,43 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on the audio file in the task."""
-        if not self.validate_input(task):
-            msg = f"Task {task!s} failed validation for stage {self}"
+        data_entry = task.data
+        file_path = data_entry.get(self.audio_filepath_key)
+        if not file_path:
+            msg = (
+                f"[{self.name}] Missing key '{self.audio_filepath_key}' in entry: "
+                f"{data_entry.get('audio_item_id', 'unknown')}"
+            )
             raise ValueError(msg)
 
-        file_path = task.data[self.filepath_key]
-        sess_name = task.data.get("session_name")
+        sess_name = data_entry.get("session_name")
         resolved_sess_name = sess_name if sess_name is not None else os.path.splitext(os.path.basename(file_path))[0]
 
         all_segments = self.diarize([file_path])
-        segments = all_segments[0]
+        raw_segments = all_segments[0]
+
+        # Prefix speaker IDs with entry identifier
+        segments = []
+        for seg in raw_segments:
+            speaker_id = self._resolve_speaker_id(data_entry, seg["speaker"])
+            if seg["end"] - seg["start"] > self.min_length:
+                segments.append({"speaker": speaker_id, "start": seg["start"], "end": seg["end"]})
 
         if self.rttm_out_dir is not None:
             _write_rttm(segments, resolved_sess_name, self.rttm_out_dir)
 
+        # Add non-speaker gap segments (fills silence between speaker turns)
+        audio_duration = data_entry.get("duration", get_audio_duration(file_path))
+        add_non_speaker_segments(segments, audio_duration, self.max_length)
+
         output_data = dict(task.data)
-        output_data[self.diar_segments_key] = segments
+        output_data[self.segments_key] = segments
+        output_data[self.overlap_segments_key] = []
 
         return AudioTask(
             task_id=f"{task.task_id}_sortformer",
             dataset_name=task.dataset_name,
-            filepath_key=task.filepath_key or self.filepath_key,
+            filepath_key=task.filepath_key or self.audio_filepath_key,
             data=output_data,
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
