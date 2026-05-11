@@ -28,11 +28,14 @@ import numpy as np
 import soundfile as sf
 import torch
 from loguru import logger
-from whisperx.audio import SAMPLE_RATE
-from whisperx.vads.pyannote import Pyannote, load_vad_model
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.stages.audio.common import get_audio_duration
+from nemo_curator.stages.audio.inference.vad.pyannote_vad import (
+    SAMPLE_RATE,
+    get_vad_segments_from_audio,
+    load_vad_model,
+)
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -58,15 +61,13 @@ class WhisperXVADModel:
         self._device = device
         self._vad_onset = vad_onset
         self._vad_offset = vad_offset
-        default_vad_options = {
-            "vad_onset": vad_onset,
-            "vad_offset": vad_offset,
-        }
 
         prev = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
         os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "true"
         try:
-            self._model = load_vad_model(torch.device(device), token=use_auth_token, **default_vad_options)
+            self._model = load_vad_model(
+                torch.device(device), vad_onset=vad_onset, vad_offset=vad_offset, token=use_auth_token
+            )
         finally:
             if prev is None:
                 os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
@@ -93,13 +94,14 @@ class WhisperXVADModel:
         Returns:
             List of VAD segment dicts with "start" and "end" keys.
         """
-        vad_segments = self._model(
-            {
-                "waveform": torch.from_numpy(audio),
-                "sample_rate": sample_rate,
-            }
+        return get_vad_segments_from_audio(
+            self._model,
+            audio,
+            sample_rate,
+            merge_max_length,
+            vad_onset=self._vad_onset,
+            vad_offset=self._vad_offset,
         )
-        return Pyannote.merge_chunks(vad_segments, merge_max_length, onset=self._vad_onset)
 
 
 @dataclass

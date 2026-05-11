@@ -14,6 +14,23 @@
 
 """Voice Activity Detection inference stages."""
 
+from nemo_curator.stages.audio.inference.vad.pyannote_vad import (
+    SAMPLE_RATE,
+    Binarize,
+    VoiceActivitySegmentation,
+    get_vad_segments_from_audio,
+    load_vad_model,
+    merge_vad_segments,
+)
 from nemo_curator.stages.audio.inference.vad.whisperx_vad import WhisperXVADModel, WhisperXVADStage
 
-__all__ = ["WhisperXVADModel", "WhisperXVADStage"]
+__all__ = [
+    "SAMPLE_RATE",
+    "Binarize",
+    "VoiceActivitySegmentation",
+    "WhisperXVADModel",
+    "WhisperXVADStage",
+    "get_vad_segments_from_audio",
+    "load_vad_model",
+    "merge_vad_segments",
+]
