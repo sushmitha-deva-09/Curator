@@ -15,5 +15,13 @@
 """ASR inference stages (backward-compatible re-export)."""
 
 from nemo_curator.stages.audio.inference.asr.asr_nemo import InferenceAsrNemoStage
+from nemo_curator.stages.audio.inference.asr.indic_conformer_nemo import (
+    INDIC_CONFORMER_NEMO_LANGS,
+    InferenceIndicConformerNeMoStage,
+)
 
-__all__ = ["InferenceAsrNemoStage"]
+__all__ = [
+    "INDIC_CONFORMER_NEMO_LANGS",
+    "InferenceAsrNemoStage",
+    "InferenceIndicConformerNeMoStage",
+]

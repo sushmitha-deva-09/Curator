@@ -101,8 +101,18 @@ deduplication_cuda12 = [
 ]
 
 audio_common = [
-    # ASR/diarization stack pulls x86_64-only transitives (kaldialign cp313, torchcodec) — gate to x86_64 Linux
-    "nemo_toolkit[asr]>=2.7.2; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    # EXPERIMENT: pin to AI4Bharat NeMo fork (nemo-v2 branch) for IndicConformer support.
+    # The fork uses NeMo 1.x APIs and conflicts with the modern Curator stack — see
+    # the override-dependencies block and [tool.uv.conflicts] below.
+    # Revert this and the [tool.uv.sources] entry to go back to upstream nemo_toolkit>=2.7.2.
+    "nemo_toolkit[asr]; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    # AI4Bharat NeMo's hf_io_mixin uses `huggingface_hub.ModelFilter`, which was
+    # removed in hf_hub>=0.24. Cap it inside this extra so other extras (vllm,
+    # ray[llm], data-designer) can still resolve modern hf_hub independently.
+    "huggingface-hub>=0.23,<0.24; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    # transformers>=4.46 requires tokenizers>=0.21 / hf_hub>=0.30 — incompatible
+    # with hf_hub<0.24. Cap the audio extra to the last line that accepts hf_hub<0.24.
+    "transformers<4.46; platform_machine == 'x86_64' and platform_system != 'Darwin'",
     "soundfile>=0.12.0",
     "torchaudio",
     "onnx>=1.19.0",
@@ -115,7 +125,10 @@ audio_common = [
     "nemo_text_processing",
     "opencc-python-reimplemented",
     "pyannote-audio>=4.0.0; platform_machine == 'x86_64' and platform_system != 'Darwin'",
-    "whisperx>=3.8.4; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    # EXPERIMENT (AI4Bharat NeMo): whisperx>=3.8.4 requires transformers>=4.48.0,
+    # which conflicts with the AI4Bharat NeMo cap of transformers<4.46. Disabled
+    # while pinning to the AI4Bharat fork. Restore when reverting.
+    # "whisperx>=3.8.4; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
 audio_cpu = [
     "nemo_curator[audio_common]",
@@ -126,7 +139,10 @@ audio_cuda12 = [
     "cuda-python>=12.3",
     "nemo_curator[audio_common]",
     "nemo_curator[cuda12]",
-    "nemo_curator[vllm]",
+    # EXPERIMENT (AI4Bharat NeMo): vllm requires modern transformers/hf_hub which
+    # conflict with AI4Bharat NeMo's pins. Drop vllm from the audio path; it isn't
+    # needed for ASR inference. Restore when reverting to upstream nemo_toolkit.
+    # "nemo_curator[vllm]",
     "nvidia-cudnn-cu12",
     "onnxruntime-gpu>=1.20.1,<1.24; platform_machine == 'x86_64'",
     "torchcodec; platform_machine == 'x86_64' and platform_system != 'Darwin'",
@@ -268,7 +284,10 @@ interleaved_cuda12 = [
 
 # Synthetic Data Generation (SDG) Dependencies
 sdg_cpu = [
-    "data-designer==0.5.5",
+    # EXPERIMENT: data-designer==0.5.5 → data-designer-engine==0.5.5 → huggingface-hub>=1.0.1,
+    # which conflicts with AI4Bharat NeMo's huggingface-hub<0.26 requirement.
+    # Disabled while pinning to the AI4Bharat NeMo fork for IndicConformer.
+    # "data-designer==0.5.5",
 ]
 
 sdg_cuda12 = [
@@ -319,6 +338,30 @@ managed = true
 default-groups = ["dev", "test"]
 index-strategy = "unsafe-best-match"
 no-build-isolation-package = ["flash-attn"]
+# EXPERIMENT (AI4Bharat NeMo): audio_common pulls AI4Bharat NeMo (transformers<4.46,
+# huggingface_hub<0.24). Other extras pull vllm/ray[llm] which require modern
+# transformers/hf_hub. Declaring them as conflicting extras lets uv solve them in
+# separate splits so a single lock can satisfy each independently.
+conflicts = [
+    # audio_common pulls AI4Bharat NeMo (hf_hub<0.24, transformers<4.46), which
+    # is incompatible with every extra that pulls modern transformers via vllm,
+    # ai-dynamo, or data-designer. Listed in a single N-way conflict group so
+    # uv can produce a tractable number of resolution splits.
+    [
+        { extra = "audio_common" },
+        { extra = "audio_cpu" },
+        { extra = "audio_cuda12" },
+        { extra = "vllm" },
+        { extra = "inference_server" },
+        { extra = "sdg_cuda12" },
+        { extra = "text_cuda12" },
+        { extra = "video_cuda12" },
+        { extra = "interleaved_cuda12" },
+        { extra = "math_cuda12" },
+        { extra = "image_cuda12" },
+        { extra = "all" },
+    ],
+]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Addresses CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.6", # Address CVE GHSA-m959-cc7f-wv43
@@ -331,19 +374,34 @@ constraint-dependencies = [
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
     "urllib3>=2.6.3", # Address CVE GHSA-38jv-5279-wg99
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
-    "transformers>=4.56.0", # removed <5.0 cap to allow qwen3_5_moe support
+    # EXPERIMENT (AI4Bharat NeMo): tightened by override-dependencies below to <4.46
+    # because transformers>=4.50 requires huggingface_hub>=0.30, which conflicts with
+    # AI4Bharat NeMo's hf_io_mixin requirement of hf_hub<0.24 (ModelFilter).
+    # "transformers>=4.56.0", # removed <5.0 cap to allow qwen3_5_moe support
 ]
 override-dependencies = [
+    # EXPERIMENT (AI4Bharat NeMo): commented entries below are the original Curator
+    # overrides; restore them when reverting to upstream nemo_toolkit>=2.7.2.
     "fsspec>=2025.3.0", # required for nemo-toolkit[asr]==2.7.2 (fsspec==2024.12.0), override due to data-designer-engine==0.5.5 requires >=2025.3.0
     "apex; sys_platform == 'never'",
     "distance; sys_platform == 'never'",
-    "huggingface-hub>=0.34", # removed <1.0 cap — vllm 0.17+ / transformers 5.x need hf_hub>=1.0
-    "transformers>=4.56.0", # Override nemo-toolkit's <4.58 pin — qwen3_5_moe needs newer transformers
+    # AI4Bharat NeMo pins `huggingface_hub==0.23.2` exactly, which prevents the
+    # resolver from picking a flexible version. Relax it; the audio_common extra
+    # then constrains the actual version (<0.24) so ModelFilter still imports.
+    "huggingface-hub>=0.23",
+    # AI4Bharat NeMo's exp_manager imports `NeptuneLogger` from the top-level
+    # pytorch_lightning.loggers namespace, which was removed in PL>=2.4. Cap
+    # globally because PL is widely shared across extras and this version still
+    # works for non-audio paths.
+    "pytorch-lightning>=2.2.1,<2.4",
+    # "transformers>=4.56.0",        # AI4Bharat NeMo pins transformers>=4.36.0 (no upper); resolver picks
     "kaldiio;  sys_platform == 'never'",
     "levenshtein;  sys_platform == 'never'",
-    "numpy>=2.0.0,<=2.2.0", # Override nemo-toolkits constraint of <2.0.0, upperbounds for Numba compatibility
-    "protobuf>=5.29.5,<7.0",  # Override nemo-toolkits constraint of ~=5.29.5; <7.0 due to ray serve FieldDescriptor API breakage
-    "setuptools>=80.10.1", # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
+    # "numpy>=2.0.0,<=2.2.0",        # AI4Bharat NeMo pins numpy>=1.22 only; align via numpy==1.26 to match working Dockerfile
+    "numpy==1.26.4",
+    "protobuf>=5.29.5,<7.0",
+    # "setuptools>=80.10.1",         # AI4Bharat NeMo + lightning_fabric need setuptools<81 for pkg_resources
+    "setuptools>=65.5.1,<81",
     "torch==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
     "torchaudio==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
     "torchvision==0.25.0", # Match torch==2.10.0
@@ -369,6 +427,9 @@ url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
+# EXPERIMENT: AI4Bharat NeMo fork for IndicConformer multilingual tokenizer + multisoftmax.
+# Comment this out to fall back to the upstream nemo_toolkit from PyPI.
+nemo_toolkit = { git = "https://github.com/AI4Bharat/NeMo.git", rev = "nemo-v2" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
     { index = "pypi", marker = "sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')" },
