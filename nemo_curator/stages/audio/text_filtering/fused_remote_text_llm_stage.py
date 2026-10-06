@@ -22,9 +22,12 @@ a single actor that fires all enabled sub-stage prompts concurrently via
 
 Typical usage in ``run_text_pipeline.py`` with ``--fuse_stages``:
 
-    sub = [LanguageID_stage, ITN_stage, Captioning_stage, ...]
+    sub = [ITN_stage, Captioning_stage, CodeSwitching_stage, ...]
     stages.append(FusedRemoteTextLLMStage(sub_stages=sub, ...))
-    # LLMLanguageVerification and DisfluencyRemoval still follow as separate stages.
+    # Dependent stages such as DisfluencyRemoval still follow separately.
+
+LanguageID is deliberately kept serial in that pipeline so every language-ID
+backend predicts and verifies at the same point in the row-mutation sequence.
 """
 
 from __future__ import annotations
@@ -174,7 +177,7 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
         for sub in self.sub_stages:
             valid_indices: list[int] = []
             messages_list: list[list[dict]] = []
-            for i, task in enumerate(tasks):
+            for i, task in sub._source_language_enabled_tasks(tasks):
                 text = task.data.get(sub.text_key, "")
                 skip = task.data.get(sub.skip_me_key, "") if not getattr(sub, "ignore_skip_me", False) else ""
                 if skip:
@@ -201,7 +204,11 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
                 model=model,
                 generation_config=self._gen_configs[sub_name],
             )
-            return sub_name, seq_idx, ((resp[0] if resp else None) or "").strip()   # server can return [None] for empty completions
+            return (
+                sub_name,
+                seq_idx,
+                ((resp[0] if resp else None) or "").strip(),
+            )  # server can return [None] for empty completions
 
         async def _all() -> list[tuple[str, int, str]]:
             coros = []

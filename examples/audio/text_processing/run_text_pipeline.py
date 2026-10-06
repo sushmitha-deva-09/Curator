@@ -1370,7 +1370,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             f"{args.recover_entities_normalized_key}) → {args.recover_entities_output_key}"
         )
 
-
     def _make_llm_language_id_stage(source_lang_allowlist: frozenset[str] | None = None) -> object:
         return text_stage_cls(
             name="LanguageID",
@@ -1435,7 +1434,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
 
     if args.enable_language_id and args.language_id_first:
         _append_language_id_stages()
-    
 
     if args.enable_pnc:
         # When RecoverEntities ran, PnC punctuates the entity-recovered text;

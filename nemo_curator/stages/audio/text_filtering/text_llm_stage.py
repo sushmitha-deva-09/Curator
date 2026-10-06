@@ -174,6 +174,8 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
             It is used only when the prompt contains ``{language_rules}``.
         source_lang_key: Task field holding the language code used to resolve
             ``{language}`` and ``{language_rules}``.
+        source_lang_allowlist: Optional normalized language-code allowlist. Rows
+            outside it pass through untouched without invoking the model.
         text_key: Input field to read text from.
         output_text_key: Output field to write the result to.
         skip_me_key: Field that flags entries to skip.
@@ -197,6 +199,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     prompt_file: str | None = None
     language_rules: dict[str, str] | None = None
     source_lang_key: str = "source_lang"
+    source_lang_allowlist: frozenset[str] | None = None
     text_key: str = "pnc_text"
     output_text_key: str = "output_text"
     skip_me_key: str = "_skipme"
@@ -232,10 +235,26 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     _n_processed: int = field(default=0, init=False, repr=False)
     _n_filtered: int = field(default=0, init=False, repr=False)
 
+    @staticmethod
+    def _normalize_source_lang_allowlist(languages: frozenset[str] | None) -> frozenset[str] | None:
+        if languages is None:
+            return None
+        normalized_languages: set[str] = set()
+        for language in languages:
+            if not isinstance(language, str) or not language.strip():
+                message = "source_lang_allowlist must contain only non-empty language-code strings"
+                raise ValueError(message)
+            normalized_languages.add(language.strip().lower())
+        if not normalized_languages:
+            message = "source_lang_allowlist must contain at least one non-empty language code"
+            raise ValueError(message)
+        return frozenset(normalized_languages)
+
     def __post_init__(self) -> None:
         tp = self.tensor_parallel_size
         if tp and tp > 0:
             self.resources = Resources(gpus=float(tp))
+        self.source_lang_allowlist = self._normalize_source_lang_allowlist(self.source_lang_allowlist)
         if self.language_rules is not None:
             if not isinstance(self.language_rules, dict):
                 message = "language_rules must be a dictionary or None"
@@ -321,12 +340,26 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
 
     def inputs(self) -> tuple[list[str], list[str]]:
         required = [self.text_key, self.skip_me_key]
-        if self.language_rules is not None:
+        if self.language_rules is not None or self.source_lang_allowlist is not None:
             required.append(self.source_lang_key)
         return [], required
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_text_key]
+
+    def _is_source_language_enabled(self, task_data: dict) -> bool:
+        """Return whether this row is routed to the stage's optional allowlist."""
+        if self.source_lang_allowlist is None:
+            return True
+        raw_language = task_data.get(self.source_lang_key)
+        if not isinstance(raw_language, str) or not raw_language.strip():
+            message = f"{self.name}: {self.source_lang_key!r} must be a non-empty string for routed inference"
+            raise ValueError(message)
+        return raw_language.strip().lower() in self.source_lang_allowlist
+
+    def _source_language_enabled_tasks(self, tasks: list[AudioTask]) -> list[tuple[int, AudioTask]]:
+        """Return indexed tasks routed to this stage."""
+        return [(index, task) for index, task in enumerate(tasks) if self._is_source_language_enabled(task.data)]
 
     # ── Prompt formatting ────────────────────────────────────────────
 
@@ -351,8 +384,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
             if language_rule is None:
                 supported = ", ".join(sorted(self.language_rules))
                 message = (
-                    f"{self.name}: unsupported {self.source_lang_key}={raw_language!r}; "
-                    f"supported codes: {supported}"
+                    f"{self.name}: unsupported {self.source_lang_key}={raw_language!r}; supported codes: {supported}"
                 )
                 raise ValueError(message)
             prompt_template = prompt_template.replace("{language_rules}", language_rule)
@@ -549,7 +581,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
         valid_indices: list[int] = []
         prompts: list[str] = []
 
-        for i, task in enumerate(tasks):
+        for i, task in self._source_language_enabled_tasks(tasks):
             if self.skip_if_output_exists and self.output_text_key in task.data:
                 set_note(task.data, self.name, "skipped (output exists)", self.notes_key)
                 continue

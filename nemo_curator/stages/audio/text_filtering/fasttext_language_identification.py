@@ -56,7 +56,7 @@ class _FastTextLanguageIdentificationStage(ProcessingStage[AudioTask, AudioTask]
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     backend_name: ClassVar[str] = ""
-    supported_backends: ClassVar[frozenset[str]] = frozenset({"fasttext", "indiclid"})
+    supported_backends: ClassVar[frozenset[str]] = frozenset({"llm", "fasttext", "indiclid"})
 
     _model: Any = field(default=None, init=False, repr=False)
     _model_labels: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
@@ -173,6 +173,9 @@ class _FastTextLanguageIdentificationStage(ProcessingStage[AudioTask, AudioTask]
         eligible_tasks: list[AudioTask] = []
         texts: list[str] = []
         for task in tasks:
+            should_process, source_language = self._is_routed_to_this_stage(task)
+            if not should_process:
+                continue
             if task.data.get(self.skip_me_key, ""):
                 task.data[self.output_text_key] = ""
                 set_note(task.data, self.name, "skipped (flagged)", self.notes_key)
@@ -183,9 +186,6 @@ class _FastTextLanguageIdentificationStage(ProcessingStage[AudioTask, AudioTask]
                 set_note(task.data, self.name, "skipped (empty)", self.notes_key)
                 continue
 
-            should_process, source_language = self._is_routed_to_this_stage(task)
-            if not should_process:
-                continue
             self._validate_source_language(source_language)
             if "\x00" in text:
                 msg = f"{type(self).__name__} does not accept NUL characters in {self.text_key!r}"
