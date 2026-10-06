@@ -24,19 +24,19 @@ All stages use the same model ID but load independently per actor.
 Architecture:
     ALMManifestReader (CPU)
         → reads per-shard JSONL output from the ASR pipeline
-    [if CPU LanguageID or --language_id_first] LanguageID + verification
-        → runs on abbreviated_text before PnC
+    [if --enable_language_id and --language_id_first] LanguageID + verification
+        → every backend runs on abbreviated_text before PnC
     [if --enable_pnc] TextLLMStage: PnC (GPU)
         → restores punctuation/capitalisation, writes pnc_text
-    [if default LLM LanguageID] TextLLMStage: LanguageID (GPU)
-        → runs on pnc_text after PnC
-    LanguageID can use an LLM GPU, FastText CPU, or IndicLID CPU backend
+    [if --enable_language_id without --language_id_first] LanguageID + verification
+        → every backend runs on the configured PnC output after PnC
+    LanguageID can use an LLM GPU, FastText CPU, or IndicLID CPU backend,
+        or route rows by source_lang across all three
         → LLM preserves the existing prompt path; CPU backends reproduce the
           local evaluation preprocessing and batched top-1 inference
         → all backends write the same llm_language_prediction field
         → LLMLanguageVerificationStage (CPU): compares to source_lang; keeps
-          code-switched samples containing source_lang, else sets _skipme to
-          "Wrong language:LLMLanguageVerification"
+          every code-switched sample and flags single-language mismatches
     [if --enable_tn] TextLLMStage: TN (GPU)
         → text normalization (written→spoken), preserves disfluencies
         → writes tn_raw
@@ -87,12 +87,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from loguru import logger
 
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.alm.alm_manifest_reader import ALMManifestReader
+from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.resources import Resources
+from nemo_curator.tasks import AudioTask
 from nemo_curator.stages.audio.alm.sharded_manifest_writer import ShardedManifestWriterStage
 from nemo_curator.stages.audio.text_filtering.acoustic_distractor import AcousticDistractorStage
 from nemo_curator.stages.audio.text_filtering.contextual_asr_extraction import ContextualASRExtractionStage
@@ -138,8 +142,68 @@ _CODE_SWITCHING_PROMPT = _PROMPT_DIR / "code_switching_prompt.md"
 _SPEECH_QA_PROMPT = _PROMPT_DIR / "speech_qa_prompt.md"
 _LANGUAGE_ID_PROMPT = _PROMPT_DIR / "language_id_prompt.md"
 _RECOVER_ENTITIES_PROMPT = _PROMPT_DIR / "recover_entities_prompt.md"
+
+@dataclass
+class FieldCopyStage(ProcessingStage[AudioTask, AudioTask]):
+    """Copy one manifest field to another (CPU, zero-cost).
+
+    Useful for aliasing stage outputs — e.g. copying ``pnc_text`` → ``tn_raw``
+    so downstream stages that read ``tn_raw`` receive the PnC result when the
+    TN stage is disabled.  Records with a non-empty ``_skipme`` are passed
+    through unchanged (dst_key is still written as empty string for schema
+    consistency).
+    """
+
+    src_key: str = ""
+    dst_key: str = ""
+    name: str = "FieldCopy"
+    skip_me_key: str = "_skipme"
+    ignore_skip_me: bool = False
+    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
+
+    def __post_init__(self) -> None:
+        if not self.src_key or not self.dst_key:
+            msg = "FieldCopyStage requires non-empty src_key and dst_key"
+            raise ValueError(msg)
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.src_key, self.skip_me_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return [], [self.dst_key]
+
+    def _copy(self, task: AudioTask) -> AudioTask:
+        if not self.ignore_skip_me and task.data.get(self.skip_me_key, ""):
+            task.data.setdefault(self.dst_key, "")
+        else:
+            task.data[self.dst_key] = task.data.get(self.src_key, "")
+        return task
+
+    def process(self, task: AudioTask) -> AudioTask:
+        return self._copy(task)
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        return [self._copy(t) for t in tasks]
+
+
 _LANGUAGE_ID_BACKENDS = frozenset({"llm", "fasttext", "indiclid", "config"})
 _CPU_LANGUAGE_ID_BACKENDS = frozenset({"fasttext", "indiclid"})
+_ROUTED_LANGUAGE_ID_BACKENDS = frozenset({"llm"}) | _CPU_LANGUAGE_ID_BACKENDS
+
+# Evaluated Granary 22-language routing. Keep these sets next to the runner,
+# matching the language-based model selection in the audio ASR example, so a
+# production invocation does not depend on an external JSON file. Sindhi is
+# deliberately absent from both CPU sets: the evaluated ASR text is Devanagari,
+# while IndicLID-FTN only exposes ``snd_Arab`` and both CPU models scored 0%.
+_FASTTEXT_LANGUAGE_ID_LANGS = frozenset({"bn", "hi", "kn", "mr", "pa", "ta", "te"})
+_INDICLID_LANGUAGE_ID_LANGS = frozenset(
+    {"as", "brx", "doi", "gu", "kok", "ks", "mai", "ml", "mni", "ne", "or", "sa", "sat", "ur"}
+)
+_DEFAULT_LANGUAGE_ID_BACKEND_BY_LANGUAGE = {
+    **dict.fromkeys(sorted(_FASTTEXT_LANGUAGE_ID_LANGS), "fasttext"),
+    **dict.fromkeys(sorted(_INDICLID_LANGUAGE_ID_LANGS), "indiclid"),
+    "sd": "llm",
+}
 _SAMPLING_STAGE_KEYS = frozenset(
     {
         "recover_entities",
@@ -157,7 +221,7 @@ _SAMPLING_STAGE_KEYS = frozenset(
 
 
 def _load_language_id_backend_config(path: str) -> dict[str, str]:
-    """Load a strict ``source_lang -> CPU backend`` JSON mapping."""
+    """Load a strict ``source_lang -> backend`` JSON routing override."""
     config_path = Path(path)
     try:
         parsed = json.loads(config_path.read_text(encoding="utf-8"))
@@ -182,10 +246,10 @@ def _load_language_id_backend_config(path: str) -> dict[str, str]:
             raise TypeError(msg)
         language = raw_language.strip().lower()
         backend = raw_backend.strip().lower()
-        if backend not in _CPU_LANGUAGE_ID_BACKENDS:
+        if backend not in _ROUTED_LANGUAGE_ID_BACKENDS:
             msg = (
                 f"Language-ID backend for {raw_language!r} must be one of "
-                f"{sorted(_CPU_LANGUAGE_ID_BACKENDS)}, got {raw_backend!r}"
+                f"{sorted(_ROUTED_LANGUAGE_ID_BACKENDS)}, got {raw_backend!r}"
             )
             raise ValueError(msg)
         if language in normalized:
@@ -215,11 +279,15 @@ def _resolve_language_id_configuration(args: argparse.Namespace) -> tuple[dict[s
         return None, "llm_language_prediction"
 
     if backend == "config":
-        if not args.language_id_backend_config_file:
-            msg = "--language_id_backend=config requires --language_id_backend_config_file"
-            raise ValueError(msg)
-        backend_by_language = _load_language_id_backend_config(args.language_id_backend_config_file)
+        backend_by_language = (
+            _load_language_id_backend_config(args.language_id_backend_config_file)
+            if args.language_id_backend_config_file
+            else dict(_DEFAULT_LANGUAGE_ID_BACKEND_BY_LANGUAGE)
+        )
         selected_backends = set(backend_by_language.values())
+        if selected_backends == {"llm"}:
+            msg = "An all-LLM routing config is redundant; use --language_id_backend=llm instead"
+            raise ValueError(msg)
     else:
         if args.language_id_backend_config_file:
             msg = "--language_id_backend_config_file requires --language_id_backend=config"
@@ -379,7 +447,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=False,
         help=(
             "Enable language identification plus CPU verification. The default --language_id_backend=llm "
-            "preserves the existing LLM behavior; fasttext, indiclid, and config select local CPU models."
+            "preserves the existing LLM behavior; fasttext and indiclid select one local CPU model, while config "
+            "uses the built-in per-language FastText/IndicLID/LLM routing."
         ),
     )
     ap.add_argument(
@@ -389,8 +458,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Language-ID implementation. 'llm' preserves the existing prompt stage; 'fasttext' and 'indiclid' "
             "use one local model for every row; 'config' routes each row by source_lang using "
-            "--language_id_backend_config_file. Direct fasttext fails closed if any row's source_lang is not "
-            "an exact lid.176 label; route unsupported Indic codes (and the qualified kok/gom proxy) to IndicLID."
+            "the built-in evaluated 22-language split (FastText/IndicLID, with Sindhi routed to the LLM). "
+            "--language_id_backend_config_file can optionally override that split. Direct fasttext fails closed "
+            "if any row's source_lang is not an exact lid.176 label."
         ),
     )
     ap.add_argument(
@@ -398,9 +468,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         type=str,
         default=None,
         help=(
-            "Strict JSON object mapping each source_lang code to 'fasttext' or 'indiclid'. Required only for "
-            "--language_id_backend=config; a row whose source_lang is absent fails closed. Example: "
-            '{"hi":"fasttext","brx":"indiclid"}.'
+            "Optional JSON override mapping each source_lang code to 'llm', 'fasttext', or 'indiclid'. Valid only "
+            "with --language_id_backend=config; without it, the runner uses its built-in evaluated 22-language "
+            "routing. A row whose source_lang is absent from the selected mapping fails closed. Example: "
+            "examples/audio/text_processing/language_id_backends_indic_22.json."
         ),
     )
     ap.add_argument(
@@ -420,8 +491,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         action="store_true",
         default=False,
         help=(
-            "Run LLM language ID and verification before PnC and keep it out of stage fusion. CPU language-ID "
-            "backends always run in this position so wrong-language rows are flagged before rewrite stages."
+            "Run language ID and verification before PnC for every backend. Without this option, every backend "
+            "runs after PnC. Language ID is always serial and is never included in stage fusion."
         ),
     )
     ap.add_argument(
@@ -429,8 +500,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         type=str,
         default=None,
         help=(
-            "Input field for language ID. Defaults to pnc_text for the legacy LLM path, and abbreviated_text "
-            "for --language_id_first or any CPU backend."
+            "Input field for language ID, applied identically to every backend. Defaults to --pnc_output_key "
+            "when PnC is enabled, existing pnc_text otherwise, or abbreviated_text with --language_id_first."
         ),
     )
     ap.add_argument(
@@ -465,6 +536,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=False,
         help="Enable SpeechQA stage: generates a (Q, A) pair grounded in the transcript, or the "
         "single token SKIP when the transcript is not suitable. Output key: speech_qa_text",
+    )
+    ap.add_argument(
+        "--ignore_skip_me",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Process ALL samples regardless of the '_skipme' flag (default: True). "
+        "Pass --no_ignore_skip_me to respect the '_skipme' field and skip flagged records.",
     )
     ap.add_argument(
         "--enable_instruction_packer",
@@ -943,10 +1021,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "--fuse_stages",
         action="store_true",
         default=False,
-        help="Fuse independent LLM stages (Captioning, CodeSwitching, SpeechQA, and LLM LanguageID unless "
-        "--language_id_first) into a single actor that fires their prompts in parallel via asyncio.gather. "
-        "CPU language-ID backends are never fused. Only active with --use_inference_server. TN always runs "
-        "serially before the fused actor; dependent ITN and verification stages run after it.",
+        help="Fuse independent LLM stages (Captioning, CodeSwitching, and SpeechQA) into a single actor that "
+        "fires their prompts in parallel via asyncio.gather. Language ID is always serial so every backend has "
+        "the same mutation order. Only active with --use_inference_server. TN always runs serially before the "
+        "fused actor; dependent ITN stages run after it.",
     )
 
     return ap
@@ -1201,13 +1279,15 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         "kv_cache_dtype": args.kv_cache_dtype,
         "num_workers_override": args.num_workers,
         "batch_size": args.batch_size,
+        "ignore_skip_me": args.ignore_skip_me,
         **remote_kwargs,
     }
 
-    # When --fuse_stages is active, parallel LLM stages are collected here and
-    # wrapped in one FusedRemoteTextLLMStage actor. First-position LLM LID and
-    # both CPU LID backends stay serial before PnC. Only has effect with
-    # --use_inference_server; falls back to normal behaviour otherwise.
+    # When --fuse_stages is active, parallel rewrite stages are collected here
+    # and wrapped in one FusedRemoteTextLLMStage actor. Language ID stays serial
+    # for every backend so prediction, verification, and _skipme mutations occur
+    # at the same point in the pipeline. Fusion only has an effect with
+    # --use_inference_server; it falls back to normal behaviour otherwise.
     use_fusing = bool(args.fuse_stages and remote_base_url)
     fuseable_sub_stages: list[RemoteTextLLMStage] = []
 
@@ -1231,10 +1311,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     base_text_key = downstream_recovered or args.text_key  # TN / ITN(no-TN) / Captioning / CS / QA
     if args.language_id_text_key:
         langid_text_key = args.language_id_text_key
-    elif args.language_id_backend != "llm" or args.language_id_first:
+    elif args.language_id_first:
         langid_text_key = recovered_key or "abbreviated_text"
     else:
-        langid_text_key = downstream_recovered or "pnc_text"
+        langid_text_key = downstream_recovered or (args.pnc_output_key if args.enable_pnc else "pnc_text")
 
     # ITN reads tn_raw (TN's spoken form) when TN is enabled, else the base text.
     itn_input_key = args.tn_output_key if args.enable_tn else base_text_key
@@ -1290,70 +1370,72 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             f"{args.recover_entities_normalized_key}) → {args.recover_entities_output_key}"
         )
 
-    # Stages that consume outputs produced inside FusedRemoteTextLLMStage are
-    # collected here and appended immediately after the fused actor.
-    post_fused_stages: list = []
 
-    def _make_llm_language_id_stage() -> object:
+    def _make_llm_language_id_stage(source_lang_allowlist: frozenset[str] | None = None) -> object:
         return text_stage_cls(
             name="LanguageID",
             prompt_file=language_id_prompt,
             text_key=langid_text_key,
             output_text_key=language_id_output_key,
+            source_lang_allowlist=source_lang_allowlist,
             enable_validation=False,
             **_resolve_stage_sampling(args, "language_id"),
             **shared_model_kwargs,
         )
 
-    if args.enable_language_id and args.language_id_backend != "llm":
-        if args.language_id_backend == "config":
-            selected_cpu_backends = set(language_id_backend_config.values())
+    def _append_language_id_stages() -> None:
+        """Append one backend-neutral LanguageID + verification group."""
+        if args.language_id_backend == "llm":
+            stages.append(_make_llm_language_id_stage())
         else:
-            selected_cpu_backends = {args.language_id_backend}
+            if args.language_id_backend == "config":
+                selected_backends = set(language_id_backend_config.values())
+                llm_languages = frozenset(
+                    language for language, backend in language_id_backend_config.items() if backend == "llm"
+                )
+            else:
+                selected_backends = {args.language_id_backend}
+                llm_languages = frozenset()
 
-        common_cpu_lid_kwargs = {
-            "name": "LanguageID",
-            "text_key": langid_text_key,
-            "output_text_key": language_id_output_key,
-            "backend_by_language": language_id_backend_config,
-        }
-        if "fasttext" in selected_cpu_backends:
-            stages.append(
-                FastTextLanguageIdentificationStage(
-                    model_path=args.fasttext_lid_model_path,
-                    **common_cpu_lid_kwargs,
+            if "llm" in selected_backends:
+                stages.append(_make_llm_language_id_stage(llm_languages))
+
+            common_cpu_lid_kwargs = {
+                "name": "LanguageID",
+                "text_key": langid_text_key,
+                "output_text_key": language_id_output_key,
+                "backend_by_language": language_id_backend_config,
+            }
+            if "fasttext" in selected_backends:
+                stages.append(
+                    FastTextLanguageIdentificationStage(
+                        model_path=args.fasttext_lid_model_path,
+                        **common_cpu_lid_kwargs,
+                    )
                 )
-            )
-        if "indiclid" in selected_cpu_backends:
-            stages.append(
-                IndicLIDLanguageIdentificationStage(
-                    model_path=args.indiclid_lid_model_path,
-                    **common_cpu_lid_kwargs,
+            if "indiclid" in selected_backends:
+                stages.append(
+                    IndicLIDLanguageIdentificationStage(
+                        model_path=args.indiclid_lid_model_path,
+                        **common_cpu_lid_kwargs,
+                    )
                 )
-            )
-        # Keep the exact production row contract: the predictor writes only
-        # llm_language_prediction, then the existing verifier owns _skipme and
-        # additional_notes.LLMLanguageVerification exactly as in the LLM path.
+
+        # Every predictor writes the same field, and exactly one verifier owns
+        # language-related _skipme and additional_notes mutations.
         stages.append(LLMLanguageVerificationStage())
         logger.info(
-            "LanguageID + LLMLanguageVerification stages enabled (backend={}): {} → {} "
-            "→ keep code-switch w/ source_lang, else _skipme='Wrong language:LLMLanguageVerification'",
+            "LanguageID + LLMLanguageVerification stages enabled (backend={}, position={}): {} → {} "
+            "→ keep every code-switch; flag single-language mismatches",
             args.language_id_backend,
+            "before PnC" if args.language_id_first else "after PnC",
             langid_text_key,
             language_id_output_key,
         )
 
-    # The optional first-position LLM path is the exact ordering used by the
-    # Indic handbook: verification flags rows before PnC and expensive rewrites.
-    if args.enable_language_id and args.language_id_backend == "llm" and args.language_id_first:
-        stages.append(_make_llm_language_id_stage())
-        stages.append(LLMLanguageVerificationStage())
-        logger.info(
-            "LanguageID + LLMLanguageVerification stages enabled (--language_id_first): {} → {} "
-            "→ keep code-switch w/ source_lang, else _skipme='Wrong language:LLMLanguageVerification'",
-            langid_text_key,
-            language_id_output_key,
-        )
+    if args.enable_language_id and args.language_id_first:
+        _append_language_id_stages()
+    
 
     if args.enable_pnc:
         # When RecoverEntities ran, PnC punctuates the entity-recovered text;
@@ -1370,24 +1452,28 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 **shared_model_kwargs,
             )
         )
-        logger.info(f"PnC stage enabled: {pnc_input_key} → {args.pnc_output_key}")
-
-    if args.enable_language_id and args.language_id_backend == "llm" and not args.language_id_first:
-        _language_id_stage = _make_llm_language_id_stage()
-        if use_fusing:
-            fuseable_sub_stages.append(_language_id_stage)
-            # LLMLanguageVerification reads llm_language_prediction written by the fused stage;
-            # must come after it — collected here and inserted at assembly time below.
-            post_fused_stages.append(LLMLanguageVerificationStage())
-        else:
-            stages.append(_language_id_stage)
-            stages.append(LLMLanguageVerificationStage())
-        logger.info(
-            "LanguageID + LLMLanguageVerification stages enabled: {} → {} "
-            "→ keep code-switch w/ source_lang, else _skipme='Wrong language:LLMLanguageVerification'",
-            langid_text_key,
-            language_id_output_key,
+        # Copy pnc_text → tn_raw so downstream stages that read tn_raw (ITN,
+        # Captioning, CodeSwitching, SpeechQA when TN is disabled) receive the
+        # punctuated text rather than the raw abbreviated_text.
+        stages.append(
+            FieldCopyStage(
+                name="PnC→tn_raw",
+                src_key=args.pnc_output_key,
+                dst_key=args.tn_output_key,
+                ignore_skip_me=args.ignore_skip_me,
+            )
         )
+        logger.info(
+            "PnC stage enabled: %s → %s (also copied to %s)",
+            pnc_input_key, args.pnc_output_key, args.tn_output_key,
+        )
+
+    if args.enable_language_id and not args.language_id_first:
+        _append_language_id_stages()
+    
+    # Stages that consume outputs produced inside FusedRemoteTextLLMStage are
+    # collected here and appended immediately after the fused actor.
+    post_fused_stages: list = []
 
     if args.enable_tn:
         _tn_stage = text_stage_cls(
@@ -1616,11 +1702,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 "FusedRemoteTextLLMStage assembled: %s sub-stages firing in parallel",
                 [s.name for s in fuseable_sub_stages],
             )
-        # Post-fused stages depend on outputs written by the fused actor
-        # (llm_language_prediction → LLMLanguageVerification, itn_raw → DisfluencyRemoval).
-        # Append them even when there are no fuseable sub-stages: CPU LanguageID
-        # is serial, and TN → ITN must not disappear merely because --fuse_stages
-        # was also requested.
+        # Post-fused stages depend on outputs written by the fused actor (for
+        # example, itn_raw → DisfluencyRemoval). Append them even when there
+        # are no fuseable sub-stages so TN → ITN does not disappear merely
+        # because --fuse_stages was also requested.
         stages.extend(post_fused_stages)
 
     if args.enable_instruction_packer:

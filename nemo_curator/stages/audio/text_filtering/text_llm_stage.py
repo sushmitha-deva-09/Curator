@@ -221,6 +221,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     kv_cache_dtype: str = "fp8"
     num_workers_override: int | None = None
     skip_if_output_exists: bool = False
+    ignore_skip_me: bool = False
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 64
 
@@ -553,7 +554,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
                 set_note(task.data, self.name, "skipped (output exists)", self.notes_key)
                 continue
             text = task.data.get(self.text_key, "")
-            skip = task.data.get(self.skip_me_key, "")
+            skip = task.data.get(self.skip_me_key, "") if not self.ignore_skip_me else ""
             if skip:
                 task.data[self.output_text_key] = ""
                 set_note(task.data, self.name, "skipped (flagged)", self.notes_key)

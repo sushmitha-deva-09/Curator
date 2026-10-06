@@ -32,10 +32,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from loguru import logger
+# Kashmiri Nastaliq rare Arabic diacritics that cause vLLM Rust tokenizer panics
+# when PnC outputs garbled/truncated text containing these chars adjacent to \uFFFD.
+# These are stripped from pnc_text for ks language only, after PnC inference.
+_KS_PROBLEM_DIACRITICS_RE = re.compile(
+    "[\ufffd"          # replacement char (garbled PnC output)
+    "\u0655"           # ARABIC HAMZA BELOW
+    "\u065b"           # ARABIC VOWEL SIGN INVERTED SMALL V ABOVE
+    "\u065a"           # ARABIC VOWEL SIGN SMALL V ABOVE
+    "\u0656"           # ARABIC SUBSCRIPT ALEF
+    "\u0654"           # ARABIC HAMZA ABOVE
+    "\u06ea"           # ARABIC EMPTY CENTRE LOW STOP  (named in crash)
+    "\u0657"           # ARABIC INVERTED DAMMA
+    "]"
+)
+
+from loguru import logger  # noqa: E402
 
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.audio.pipeline_utils import set_note
@@ -72,6 +88,7 @@ class RemoteTextLLMStage(TextLLMStage):
     served_model_name: str | None = None
     max_concurrent_requests: int = 64
     request_timeout: int = 120
+    ignore_skip_me: bool = False
 
     _client: Any = field(default=None, init=False, repr=False)
     _gen_config: Any = field(default=None, init=False, repr=False)
@@ -204,7 +221,7 @@ class RemoteTextLLMStage(TextLLMStage):
 
         for i, task in enumerate(tasks):
             text = task.data.get(self.text_key, "")
-            skip = task.data.get(self.skip_me_key, "")
+            skip = task.data.get(self.skip_me_key, "") if not self.ignore_skip_me else ""
             if skip:
                 task.data[self.output_text_key] = ""
                 set_note(task.data, self.name, "skipped (flagged)", self.notes_key)
@@ -236,6 +253,17 @@ class RemoteTextLLMStage(TextLLMStage):
                 else:
                     task.data[self.output_text_key] = result_text
                     note = "applied (modified)" if result_text != input_text else "applied (unchanged)"
+
+                # Kashmiri-only: strip rare Arabic diacritics + replacement chars from
+                # PnC output before SpeechQA.  These cause vLLM Rust tokenizer panics
+                # (byte-boundary split inside multi-byte \uFFFD adjacent to U+06EA).
+                lang = task.data.get(self.source_lang_key, "")
+                if lang == "ks" and self.output_text_key == "pnc_text":
+                    raw = task.data[self.output_text_key]
+                    sanitized = _KS_PROBLEM_DIACRITICS_RE.sub("", raw)
+                    if sanitized != raw:
+                        task.data[self.output_text_key] = sanitized
+                        note += " +ks_diacritic_strip"
 
                 set_note(task.data, self.name, note, self.notes_key)
                 self._n_processed += 1
