@@ -198,19 +198,33 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
 
         # Fan out ALL messages from ALL sub-stages in one asyncio.gather call.
         # Each coroutine carries (sub_name, seq_idx) so we can route results back.
-        async def _one(sub_name: str, seq_idx: int, messages: list[dict]) -> tuple[str, int, str]:
-            resp = await self._client.query_model(
-                messages=messages,
-                model=model,
-                generation_config=self._gen_configs[sub_name],
-            )
-            return (
-                sub_name,
-                seq_idx,
-                ((resp[0] if resp else None) or "").strip(),
-            )  # server can return [None] for empty completions
+        # A per-request failure (e.g. the vLLM Rust detokenizer byte-boundary
+        # panic on some Kashmiri generations) is caught here and flagged so one
+        # bad row is SKIPped instead of failing the whole batch/shard.
+        async def _one(sub_name: str, seq_idx: int, messages: list[dict]) -> tuple[str, int, str, bool]:
+            try:
+                resp = await self._client.query_model(
+                    messages=messages,
+                    model=model,
+                    generation_config=self._gen_configs[sub_name],
+                )
+                return (
+                    sub_name,
+                    seq_idx,
+                    ((resp[0] if resp else None) or "").strip(),
+                    True,
+                )  # server can return [None] for empty completions
+            except Exception as exc:  # noqa: BLE001 — isolate one bad row
+                logger.warning(
+                    "{}: {} request failed (seq={}); marking SKIP: {}",
+                    self.name,
+                    sub_name,
+                    seq_idx,
+                    str(exc)[:200],
+                )
+                return (sub_name, seq_idx, "", False)
 
-        async def _all() -> list[tuple[str, int, str]]:
+        async def _all() -> list[tuple[str, int, str, bool]]:
             coros = []
             for sub in self.sub_stages:
                 _, messages_list = per_sub[sub.name]
@@ -221,10 +235,10 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
         raw_results = self._loop_runner.run(_all(), timeout=self._batch_timeout(total_requests))
 
         # Route results back to tasks, applying per-sub-stage validation.
-        # Group results by sub_name first for O(1) lookup.
-        results_by_sub: dict[str, dict[int, str]] = {}
-        for sub_name, seq_idx, text in raw_results:
-            results_by_sub.setdefault(sub_name, {})[seq_idx] = text
+        # Group results by sub_name first for O(1) lookup. Value is (text, ok).
+        results_by_sub: dict[str, dict[int, tuple[str, bool]]] = {}
+        for sub_name, seq_idx, text, ok in raw_results:
+            results_by_sub.setdefault(sub_name, {})[seq_idx] = (text, ok)
 
         for sub in self.sub_stages:
             valid_indices, _ = per_sub[sub.name]
@@ -232,7 +246,15 @@ class FusedRemoteTextLLMStage(ProcessingStage["AudioTask", "AudioTask"]):
             for seq_idx, task_idx in enumerate(valid_indices):
                 task = tasks[task_idx]
                 input_text = task.data[sub.text_key]
-                result_text = sub_results.get(seq_idx, "")
+                result_text, req_ok = sub_results.get(seq_idx, ("", False))
+
+                if not req_ok:
+                    task.data[sub.output_text_key] = (
+                        "SKIP" if sub.output_text_key == "speech_qa_text" else input_text
+                    )
+                    set_note(task.data, sub.name, "skipped (generation_error)", sub.notes_key)
+                    sub._n_processed += 1
+                    continue
 
                 if sub.enable_validation:
                     ok, reason = sub._validate(input_text, result_text)

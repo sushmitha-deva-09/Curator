@@ -32,26 +32,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-# Kashmiri Nastaliq rare Arabic diacritics that cause vLLM Rust tokenizer panics
-# when PnC outputs garbled/truncated text containing these chars adjacent to \uFFFD.
-# These are stripped from pnc_text for ks language only, after PnC inference.
-_KS_PROBLEM_DIACRITICS_RE = re.compile(
-    "[\ufffd"          # replacement char (garbled PnC output)
-    "\u0655"           # ARABIC HAMZA BELOW
-    "\u065b"           # ARABIC VOWEL SIGN INVERTED SMALL V ABOVE
-    "\u065a"           # ARABIC VOWEL SIGN SMALL V ABOVE
-    "\u0656"           # ARABIC SUBSCRIPT ALEF
-    "\u0654"           # ARABIC HAMZA ABOVE
-    "\u06ea"           # ARABIC EMPTY CENTRE LOW STOP  (named in crash)
-    "\u0657"           # ARABIC INVERTED DAMMA
-    "]"
-)
-
-from loguru import logger  # noqa: E402
+from loguru import logger
 
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.audio.pipeline_utils import set_note
@@ -190,19 +174,29 @@ class RemoteTextLLMStage(TextLLMStage):
         waves = max(1, math.ceil(n_requests / concurrency))
         return per_request * waves + 120
 
-    def _generate_remote(self, messages_list: list[list[dict]]) -> list[str]:
-        """Fan out one chat request per message list, preserving order."""
+    def _generate_remote(self, messages_list: list[list[dict]]) -> list[tuple[str, bool]]:
+        """Fan out one chat request per message list, preserving order.
+
+        Returns ``(text, ok)`` per request. A per-request failure (e.g. the vLLM
+        Rust detokenizer byte-boundary panic on some generations) is caught here
+        and flagged ``ok=False`` so one bad row is SKIPped by the caller instead
+        of failing the whole batch/shard.
+        """
         model = self.served_model_name or self.model_id
 
-        async def _one(messages: list[dict]) -> str:
-            resp = await self._client.query_model(
-                messages=messages,
-                model=model,
-                generation_config=self._gen_config,
-            )
-            return ((resp[0] if resp else None) or "").strip()  # server can return [None] for empty completions
+        async def _one(messages: list[dict]) -> tuple[str, bool]:
+            try:
+                resp = await self._client.query_model(
+                    messages=messages,
+                    model=model,
+                    generation_config=self._gen_config,
+                )
+                return (((resp[0] if resp else None) or "").strip(), True)
+            except Exception as exc:  # noqa: BLE001 — isolate one bad row
+                logger.warning("{}: request failed; marking SKIP: {}", self.name, str(exc)[:200])
+                return ("", False)
 
-        async def _all() -> list[str]:
+        async def _all() -> list[tuple[str, bool]]:
             return await asyncio.gather(*[_one(m) for m in messages_list])
 
         # Drive every batch on the actor's single persistent event loop (bound
@@ -240,7 +234,15 @@ class RemoteTextLLMStage(TextLLMStage):
             for seq_idx, task_idx in enumerate(valid_indices):
                 task = tasks[task_idx]
                 input_text = task.data[self.text_key]
-                result_text = results[seq_idx]
+                result_text, req_ok = results[seq_idx]
+
+                if not req_ok:
+                    task.data[self.output_text_key] = (
+                        "SKIP" if self.output_text_key == "speech_qa_text" else input_text
+                    )
+                    set_note(task.data, self.name, "skipped (generation_error)", self.notes_key)
+                    self._n_processed += 1
+                    continue
 
                 if self.enable_validation:
                     ok, reason = self._validate(input_text, result_text)
@@ -254,17 +256,6 @@ class RemoteTextLLMStage(TextLLMStage):
                 else:
                     task.data[self.output_text_key] = result_text
                     note = "applied (modified)" if result_text != input_text else "applied (unchanged)"
-
-                # Kashmiri-only: strip rare Arabic diacritics + replacement chars from
-                # PnC output before SpeechQA.  These cause vLLM Rust tokenizer panics
-                # (byte-boundary split inside multi-byte \uFFFD adjacent to U+06EA).
-                lang = task.data.get(self.source_lang_key, "")
-                if lang == "ks" and self.output_text_key == "pnc_text":
-                    raw = task.data[self.output_text_key]
-                    sanitized = _KS_PROBLEM_DIACRITICS_RE.sub("", raw)
-                    if sanitized != raw:
-                        task.data[self.output_text_key] = sanitized
-                        note += " +ks_diacritic_strip"
 
                 set_note(task.data, self.name, note, self.notes_key)
                 self._n_processed += 1

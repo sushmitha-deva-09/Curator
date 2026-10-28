@@ -540,9 +540,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     ap.add_argument(
         "--ignore_skip_me",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Process ALL samples regardless of the '_skipme' flag (default: True). "
-        "Pass --no_ignore_skip_me to respect the '_skipme' field and skip flagged records.",
+        default=False,
+        help="Process ALL samples regardless of the '_skipme' flag (default: False). "
+        "Pass --ignore_skip_me to process flagged records too.",
     )
     ap.add_argument(
         "--enable_instruction_packer",
@@ -1318,8 +1318,15 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
 
     # ITN reads tn_raw (TN's spoken form) when TN is enabled, else the base text.
     itn_input_key = args.tn_output_key if args.enable_tn else base_text_key
-    # Captioning/CodeSwitching/SpeechQA read TN's output (tn_raw) when TN is on, else the base text.
-    post_tn_text_key = itn_input_key
+    # Captioning/CodeSwitching/SpeechQA read TN's output (tn_raw) when TN is on, else the PnC
+    # output (pnc_text) when PnC is enabled, else the base text.  This ensures downstream stages
+    # always operate on the punctuated text rather than the raw ASR key (e.g. granary_v1_prediction).
+    if args.enable_tn:
+        post_tn_text_key = itn_input_key
+    elif args.enable_pnc:
+        post_tn_text_key = args.pnc_output_key   # typically "pnc_text"
+    else:
+        post_tn_text_key = base_text_key
 
     stages = [
         ALMManifestReader(manifest_path=args.input_manifest, output_dir=args.output_dir, fanout=False),
